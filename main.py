@@ -1,151 +1,142 @@
 import time
-import uuid
-import base64
-from typing import Dict, List, Optional
-from fastapi import FastAPI, Request, Response, HTTPException, status, Query
-from fastapi.responses import JSONResponse
+from typing import Optional
+from fastapi import FastAPI, Header, HTTPException, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="Unified API Engineering Challenges")
+app = FastAPI()
 
-# ---------------------------------------------------------------------------
-# Strict Native CORS Middleware (Fixes the Grader "Failed to Fetch" Bug)
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------
+# CORS CONFIGURATION
+# ---------------------------------------------------------
+# This allows the grading website to safely communicate with your API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows browser grader extensions to cross-fetch
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["X-Request-ID", "Retry-After", "Idempotency-Key"],
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all HTTP methods (GET, POST, etc.)
+    allow_headers=["*"],  # Allows all headers (Idempotency-Key, X-Client-Id)
 )
 
-# ---------------------------------------------------------------------------
-# Assigned Constants & Data Stores
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------
+# IN-MEMORY DATABASE & STATE
+# ---------------------------------------------------------
+# 1. Catalog: 50 fixed orders (IDs 1 to 50)
 TOTAL_ORDERS = 50
-ORDERS_LIMIT = 17
-ORDERS_WINDOW = 10.0
-ORDERS_CATALOG = [{"id": i, "item": f"Item-{i}", "price": float(i * 10)} for i in range(1, TOTAL_ORDERS + 1)]
+ORDERS_CATALOG = [{"id": i, "item": f"Item {i}", "price": 10.0 * i} for i in range(1, TOTAL_ORDERS + 1)]
 
-IDEMPOTENCY_STORE: Dict[str, dict] = {}
-ORDERS_RATE_STORE: Dict[str, List[float]] = {}
+# 2. Idempotency Storage: Maps "idempotency_key" -> existing order object
+idempotency_store = {}
+next_mock_id = 101  # Dynamic IDs for newly created orders start here
 
-PING_LIMIT = 11
-PING_WINDOW = 10.0
-PING_RATE_STORE: Dict[str, List[float]] = {}
+# 3. Rate Limiting Storage: Maps "client_id" -> list of request timestamps
+rate_limit_store = {}
+RATE_LIMIT_MAX = 17
+WINDOW_SECONDS = 10.0
 
-# ---------------------------------------------------------------------------
-# Core Middleware Layer (Rate Limiting & Context Generation)
-# ---------------------------------------------------------------------------
-@app.middleware("http")
-async def context_and_rate_limit_middleware(request: Request, call_next):
-    path = request.url.path
-    
-    # Skip processing for raw OPTIONS preflights (handled automatically by CORSMiddleware)
-    if request.method == "OPTIONS":
-        return await call_next(request)
 
-    # 1. Request Context Generation
-    req_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
-    request.state.request_id = req_id
-    
-    # 2. Per-Client Rate Limiting Buckets
-    client_id = request.headers.get("X-Client-Id")
-    if client_id:
-        now = time.time()
-        
-        if "/orders" in path:
-            if client_id not in ORDERS_RATE_STORE:
-                ORDERS_RATE_STORE[client_id] = []
-            ORDERS_RATE_STORE[client_id] = [ts for ts in ORDERS_RATE_STORE[client_id] if now - ts < ORDERS_WINDOW]
-            
-            if len(ORDERS_RATE_STORE[client_id]) >= ORDERS_LIMIT:
-                oldest_ts = ORDERS_RATE_STORE[client_id][0]
-                retry_after = int(max(1, ORDERS_WINDOW - (now - oldest_ts)))
-                res = JSONResponse(
-                    status_code=429, 
-                    content={"detail": "Orders rate limit exceeded"}
-                )
-                res.headers["Retry-After"] = str(retry_after)
-                res.headers["X-Request-ID"] = req_id
-                return res
-            ORDERS_RATE_STORE[client_id].append(now)
-            
-        elif "/ping" in path:
-            if client_id not in PING_RATE_STORE:
-                PING_RATE_STORE[client_id] = []
-            PING_RATE_STORE[client_id] = [ts for ts in PING_RATE_STORE[client_id] if now - ts < PING_WINDOW]
-            
-            if len(PING_RATE_STORE[client_id]) >= PING_LIMIT:
-                res = JSONResponse(
-                    status_code=429, 
-                    content={"detail": "Ping rate limit exceeded"}
-                )
-                res.headers["X-Request-ID"] = req_id
-                return res
-            PING_RATE_STORE[client_id].append(now)
-
-    response = await call_next(request)
-    response.headers["X-Request-ID"] = req_id
-    return response
-
-# ---------------------------------------------------------------------------
-# Problem 1: Orders Routes
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------
+# DATA MODELS
+# ---------------------------------------------------------
 class OrderCreate(BaseModel):
-    item: Optional[str] = "Default Item"
-    price: Optional[float] = 0.0
+    item: str
+    price: float
 
-@app.post("/orders")
-async def create_order(request: Request, response: Response, data: Optional[OrderCreate] = None):
-    data = data or OrderCreate()
-    idempotency_key = request.headers.get("Idempotency-Key")
+
+# ---------------------------------------------------------
+# 1. IDEMPOTENT ORDER CREATION (POST)
+# ---------------------------------------------------------
+@app.post("/orders", status_code=status.HTTP_201_CREATED)
+def create_order(
+    order_data: OrderCreate,
+    response: Response,
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key")
+):
+    global next_mock_id
     
+    # If no key is provided, just create a normal transient order
     if not idempotency_key:
-        response.status_code = status.HTTP_201_CREATED
-        return {"id": f"ord_{uuid.uuid4().hex[:12]}", "item": data.item, "price": data.price}
-        
-    if idempotency_key in IDEMPOTENCY_STORE:
-        response.status_code = status.HTTP_200_OK
-        return IDEMPOTENCY_STORE[idempotency_key]
-        
-    order_id = f"ord_{uuid.uuid4().hex[:12]}"
-    saved = {"id": order_id, "item": data.item, "price": data.price}
-    IDEMPOTENCY_STORE[idempotency_key] = saved
-    
-    response.status_code = status.HTTP_201_CREATED
-    return saved
+        new_id = next_mock_id
+        next_mock_id += 1
+        return {"id": str(new_id), "item": order_data.item, "price": order_data.price}
 
+    # If key already exists, return the exact same stored order with HTTP 201
+    if idempotency_key in idempotency_store:
+        return idempotency_store[idempotency_key]
+
+    # First time seeing this key: create it, store it, and return it
+    new_id = next_mock_id
+    next_mock_id += 1
+    
+    saved_order = {"id": str(new_id), "item": order_data.item, "price": order_data.price}
+    idempotency_store[idempotency_key] = saved_order
+    return saved_order
+
+
+# ---------------------------------------------------------
+# 2. CURSOR PAGINATION (GET)
+# ---------------------------------------------------------
 @app.get("/orders")
-async def list_orders(limit: int = Query(default=10, ge=1), cursor: Optional[str] = Query(default=None)):
-    start_idx = 0
+def get_orders(
+    limit: int = 10, 
+    cursor: Optional[str] = None,
+    x_client_id: Optional[str] = Header(None, alias="X-Client-Id")
+):
+    # Enforce rate limit checking on this endpoint if the header is passed
+    if x_client_id:
+        check_rate_limit(x_client_id)
+
+    # Determine starting index based on the cursor
+    start_index = 0
     if cursor:
         try:
-            start_idx = int(base64.b64decode(cursor.encode("utf-8")).decode("utf-8"))
-        except Exception:
-            raise HTTPException(status_code=400, detail="Malformed cursor structure.")
-            
-    sliced = ORDERS_CATALOG[start_idx : start_idx + limit]
-    next_idx = start_idx + limit
-    
-    next_cursor = None
-    if next_idx < len(ORDERS_CATALOG):
-        next_cursor = base64.b64encode(str(next_idx).encode("utf-8")).decode("utf-8")
-        
-    return {"items": sliced, "next_cursor": next_cursor}
+            # We use the item ID string as our opaque cursor
+            start_index = int(cursor)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid cursor format")
 
-# ---------------------------------------------------------------------------
-# Problem 2: Context Middleware Route
-# ---------------------------------------------------------------------------
-@app.get("/ping")
-async def ping(request: Request):
+    # Slice the data safely up to the requested limit
+    end_index = start_index + limit
+    page_items = ORDERS_CATALOG[start_index:end_index]
+
+    # Calculate the next cursor string if there are more items left
+    next_cursor = None
+    if end_index < TOTAL_ORDERS:
+        next_cursor = str(end_index)
+
     return {
-        "email": "your-registered-email@example.com",  # Replace with your actual email string
-        "request_id": request.state.request_id
+        "items": page_items,
+        "next_cursor": next_cursor
     }
 
-@app.get("/")
-async def health():
-    return {"status": "healthy"}
+
+# ---------------------------------------------------------
+# 3. RATE LIMITING UTILITY
+# ---------------------------------------------------------
+def check_rate_limit(client_id: str):
+    now = time.time()
+    
+    # Initialize timestamp tracker list for a new client
+    if client_id not in rate_limit_store:
+        rate_limit_store[client_id] = []
+        
+    timestamps = rate_limit_store[client_id]
+    
+    # Evict/remove timestamps older than 10 seconds ago
+    valid_window_start = now - WINDOW_SECONDS
+    rate_limit_store[client_id] = [t for t in timestamps if t > valid_window_start]
+    
+    # If the client has used up all 17 allowed slots, block them
+    if len(rate_limit_store[client_id]) >= RATE_LIMIT_MAX:
+        # Calculate exactly how long until the oldest request falls out of the window
+        oldest_request = rate_limit_store[client_id][0]
+        retry_after = int((oldest_request + WINDOW_SECONDS) - now) + 1
+        
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Rate limit exceeded",
+            headers={"Retry-After": str(max(1, retry_after))}
+        )
+        
+    # If under the limit, record this current request timestamp
+    rate_limit_store[client_id].append(now)
