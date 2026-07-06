@@ -10,18 +10,6 @@ from pydantic import BaseModel
 app = FastAPI(title="Unified API Engineering Challenges")
 
 # ---------------------------------------------------------------------------
-# Strict Native CORS Middleware (Fixes the Grader "Failed to Fetch" Bug)
-# ---------------------------------------------------------------------------
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Allows browser grader extensions to cross-fetch
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["X-Request-ID", "Retry-After", "Idempotency-Key"],
-)
-
-# ---------------------------------------------------------------------------
 # Assigned Constants & Data Stores
 # ---------------------------------------------------------------------------
 TOTAL_ORDERS = 50
@@ -41,17 +29,17 @@ PING_RATE_STORE: Dict[str, List[float]] = {}
 # ---------------------------------------------------------------------------
 @app.middleware("http")
 async def context_and_rate_limit_middleware(request: Request, call_next):
-    path = request.url.path
-    
-    # Skip processing for raw OPTIONS preflights (handled automatically by CORSMiddleware)
+    # 1. IMMEDIATELY bypass custom logic for CORS preflight OPTIONS requests
     if request.method == "OPTIONS":
         return await call_next(request)
 
-    # 1. Request Context Generation
+    path = request.url.path
+
+    # 2. Request Context Generation
     req_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
     request.state.request_id = req_id
     
-    # 2. Per-Client Rate Limiting Buckets
+    # 3. Per-Client Rate Limiting Buckets
     client_id = request.headers.get("X-Client-Id")
     if client_id:
         now = time.time()
@@ -90,6 +78,18 @@ async def context_and_rate_limit_middleware(request: Request, call_next):
     response = await call_next(request)
     response.headers["X-Request-ID"] = req_id
     return response
+
+# ---------------------------------------------------------------------------
+# Strict Native CORS Middleware (Must be declared AFTER custom middlewares)
+# ---------------------------------------------------------------------------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Essential for cross-origin browser verification pages
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["X-Request-ID", "Retry-After", "Idempotency-Key"],
+)
 
 # ---------------------------------------------------------------------------
 # Problem 1: Orders Routes
